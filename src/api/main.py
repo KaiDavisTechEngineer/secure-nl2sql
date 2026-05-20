@@ -2,11 +2,13 @@
 """
 src/api/main.py
 
-The REST API that ties everything together:
-  1. Accepts a natural language question + database schema
-  2. Generates SQL using the fine-tuned model
-  3. Runs the security scanner on the generated SQL
-  4. Returns the query + full security report
+The REST API for SecureQuery.
+
+This version uses Hugging Face's hosted Inference API to generate SQL,
+then runs the output through our custom security scanner.
+
+This is actually how most production ML systems work — they call hosted
+models via API rather than self-hosting 7B+ parameter models.
 
 Run: uvicorn src.api.main:app --reload
 Docs: http://localhost:8000/docs
@@ -15,46 +17,38 @@ Docs: http://localhost:8000/docs
 import os
 import time
 import yaml
-import torch
-from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
 
-from src.security.scanner import SQLSecurityScanner, SecurityReport
+from src.security.scanner import SQLSecurityScanner
 
 load_dotenv()
 
 app = FastAPI(
     title="SecureQuery — NL-to-SQL + Security Analysis",
     description=(
-        "Convert natural language questions to SQL queries, "
-        "with automatic security vulnerability scanning."
+        "Convert natural language to SQL queries, with automatic "
+        "security vulnerability scanning of every generated query."
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
-# Global state
-model_pipeline = None
+hf_client = None
 security_scanner = None
 config = None
 
 
-# ── Request / Response Models ────────────────────────────────────────────────
-
 class QueryRequest(BaseModel):
     question: str = Field(..., description="Natural language question")
-    schema: str = Field(
-        default="",
-        description="Database schema hint, e.g. 'users(id, name, email, created_at)'"
-    )
+    schema: str = Field(default="", description="Database schema")
 
     class Config:
         json_schema_extra = {
             "example": {
-                "question": "Show me all customers who spent more than $500 last month",
-                "schema": "orders(id, customer_id, amount, created_at), customers(id, name, email)"
+                "question": "Show customers who spent over $500 last month",
+                "schema": "orders(id, customer_id, amount), customers(id, name)"
             }
         }
 
@@ -64,106 +58,71 @@ class QueryResponse(BaseModel):
     generated_sql: str
     security_report: dict
     latency_ms: float
-    model_version: str
+    model: str
+
+
+class ScanRequest(BaseModel):
+    sql: str
 
 
 class HealthResponse(BaseModel):
     status: str
-    model_loaded: bool
     scanner_loaded: bool
-    device: str
+    api_configured: bool
 
 
-# ── Model Loading ────────────────────────────────────────────────────────────
-
-def load_config():
+def load_config() -> dict:
     with open("configs/config.yaml") as f:
         return yaml.safe_load(f)
 
 
-def load_model():
-    global model_pipeline, security_scanner, config
+def initialize():
+    global hf_client, security_scanner, config
     config = load_config()
 
-    # Load security scanner — no GPU needed, works immediately
     security_scanner = SQLSecurityScanner()
     print("✅ Security scanner ready")
 
-    # Load NL-to-SQL model
-    model_dir = config["model"]["finetuned_model_dir"]
-    if not Path(model_dir).exists():
-        print(f"⚠️  Fine-tuned model not found at {model_dir}")
-        print(f"   Using base model: {config['model']['base_model_name']}")
-        model_dir = config["model"]["base_model_name"]
-
-    print(f"📥 Loading NL-to-SQL model from {model_dir}...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_dir,
-        token=os.getenv("HUGGINGFACE_TOKEN"),
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        device_map="auto",
-        token=os.getenv("HUGGINGFACE_TOKEN"),
-    )
-
-    model_pipeline = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        device_map="auto",
-    )
-    print(f"✅ Model ready on {device}\n")
+    hf_token = os.getenv("HUGGINGFACE_TOKEN")
+    if hf_token:
+        hf_client = InferenceClient(
+            model="defog/sqlcoder-7b-2",
+            token=hf_token,
+        )
+        print("✅ HuggingFace API connected")
+    else:
+        print("⚠️  No HUGGINGFACE_TOKEN — /query disabled, /scan still works")
 
 
 def format_prompt(question: str, schema: str) -> str:
-    """Must match the exact format used in preprocess.py during training."""
-    system = (
-        "You are a SQL expert. Convert the natural language question to a valid, "
-        "safe SQL query based on the provided database schema. "
-        "Return ONLY the SQL query with no explanation."
-    )
-    if schema:
-        user_content = f"Schema: {schema}\n\nQuestion: {question}"
-    else:
-        user_content = f"Question: {question}"
+    schema_block = schema if schema else "(schema not provided)"
+    return f"""### Task
+Generate a SQL query to answer: `{question}`
 
-    return (
-        f"### Task\n{system}\n\n"
-        f"### Input\n{user_content}\n\n"
-        f"### Response\n"
-    )
+### Database Schema
+{schema_block}
+
+### Answer
+```sql
+"""
 
 
-def extract_sql(raw_output: str, prompt: str) -> str:
-    """Pull just the generated SQL from the model's full output."""
-    # Remove the input prompt from the output
-    sql = raw_output[len(prompt):].strip()
+def extract_sql(generated_text: str) -> str:
+    sql = generated_text.strip()
+    sql = sql.split("```")[0]
+    sql = sql.split("\n\n")[0]
+    return sql.strip()
 
-    # Stop at the first blank line (model sometimes adds explanation after)
-    sql = sql.split("\n\n")[0].strip()
-
-    # Remove markdown code fences if model added them
-    sql = sql.replace("```sql", "").replace("```", "").strip()
-
-    return sql
-
-
-# ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
-    load_model()
+    initialize()
 
 
-@app.get("/", response_model=dict)
+@app.get("/")
 def root():
     return {
         "name": "SecureQuery",
-        "description": "NL-to-SQL with automatic security scanning",
         "docs": "/docs",
         "endpoints": ["/query", "/scan", "/health"],
     }
@@ -173,64 +132,47 @@ def root():
 def health():
     return HealthResponse(
         status="healthy",
-        model_loaded=model_pipeline is not None,
         scanner_loaded=security_scanner is not None,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        api_configured=hf_client is not None,
     )
 
 
 @app.post("/query", response_model=QueryResponse)
 def query(request: QueryRequest):
-    """
-    Full pipeline: natural language → SQL → security analysis.
-    This is the main endpoint.
-    """
-    if not model_pipeline:
-        raise HTTPException(status_code=503, detail="Model still loading")
-
+    if not hf_client:
+        raise HTTPException(503, "HF API not configured. Add HUGGINGFACE_TOKEN to .env")
     if not request.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-
-    if len(request.question) > config["api"]["max_question_length"]:
-        raise HTTPException(status_code=400, detail="Question too long")
+        raise HTTPException(400, "Question cannot be empty")
 
     start = time.time()
     prompt = format_prompt(request.question, request.schema)
 
-    # Step 1: Generate SQL
-    outputs = model_pipeline(
-        prompt,
-        max_new_tokens=config["api"]["max_new_tokens"],
-        temperature=config["api"]["temperature"],
-        top_p=config["api"]["top_p"],
-        do_sample=True,
-        pad_token_id=model_pipeline.tokenizer.eos_token_id,
-    )
-    generated_sql = extract_sql(outputs[0]["generated_text"], prompt)
+    try:
+        generated = hf_client.text_generation(
+            prompt,
+            max_new_tokens=config["api"]["max_new_tokens"],
+            temperature=config["api"]["temperature"],
+            top_p=config["api"]["top_p"],
+            do_sample=False,
+        )
+        sql = extract_sql(generated)
+    except Exception as e:
+        raise HTTPException(502, f"Model API error: {str(e)}")
 
-    # Step 2: Security scan
-    report: SecurityReport = security_scanner.scan(generated_sql)
-
+    report = security_scanner.scan(sql)
     latency_ms = round((time.time() - start) * 1000, 2)
 
     return QueryResponse(
         question=request.question,
-        generated_sql=generated_sql,
+        generated_sql=sql,
         security_report=report.to_dict(),
         latency_ms=latency_ms,
-        model_version="sqlcoder-7b-secure-v1",
+        model="defog/sqlcoder-7b-2 (HuggingFace Inference API)",
     )
 
 
 @app.post("/scan")
-def scan_only(sql: str):
-    """
-    Security scan only — no model needed.
-    Useful for scanning manually written SQL queries.
-    Great for demoing the security layer independently.
-    """
+def scan_only(request: ScanRequest):
     if not security_scanner:
-        raise HTTPException(status_code=503, detail="Scanner not ready")
-
-    report = security_scanner.scan(sql)
-    return report.to_dict()
+        raise HTTPException(503, "Scanner not ready")
+    return security_scanner.scan(request.sql).to_dict()
